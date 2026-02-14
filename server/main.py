@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer, VADParams
 from pipecat.frames.frames import HeartbeatFrame
-from pipecat.observers.loggers.user_bot_latency_log_observer import UserBotLatencyLogObserver
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.llm_switcher import LLMSwitcher
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -51,6 +51,7 @@ from processors.configuration import ConfigurationHandler
 from processors.context_manager import DictationContextManager
 from processors.llm_gate import LLMGateFilter
 from processors.turn_controller import TurnController
+from processors.vad_forwarding_processor import VADFrameForwardingProcessor
 from protocol.messages import (
     SetLLMProviderMessage,
     SetSTTProviderMessage,
@@ -146,6 +147,28 @@ def is_mdns_candidate(candidate: str) -> bool:
     return bool(re.search(r"\s[a-f0-9-]+\.local\s", candidate, re.IGNORECASE))
 
 
+def create_silero_vad_params(settings: Settings) -> VADParams:
+    """Build Silero VAD params from application settings.
+
+    Args:
+        settings: Application settings containing optional VAD overrides.
+
+    Returns:
+        VADParams instance populated from settings.
+    """
+    vad_params_kwargs: dict[str, float] = {}
+    if settings.vad_confidence is not None:
+        vad_params_kwargs["confidence"] = settings.vad_confidence
+    if settings.vad_start_secs is not None:
+        vad_params_kwargs["start_secs"] = settings.vad_start_secs
+    if settings.vad_stop_secs is not None:
+        vad_params_kwargs["stop_secs"] = settings.vad_stop_secs
+    if settings.vad_min_volume is not None:
+        vad_params_kwargs["min_volume"] = settings.vad_min_volume
+
+    return VADParams(**vad_params_kwargs)
+
+
 @dataclass
 class AppServices:
     """Container for application services, stored on app.state.
@@ -175,6 +198,7 @@ async def run_pipeline(
     context_manager: DictationContextManager,
     turn_controller: TurnController,
     llm_gate: LLMGateFilter,
+    vad_analyzer: SileroVADAnalyzer,
 ) -> None:
     """Run the Pipecat pipeline for a single WebRTC connection.
 
@@ -190,34 +214,19 @@ async def run_pipeline(
 
     # Create transport using the WebRTC connection
     # (client connects with enableMic: false, only enables when recording starts)
-    # Build Silero VAD analyzer from environment-configurable settings (optional)
-    # Uses defaults from the library when settings are not provided.
-    settings = services.settings
-
-    # Construct VAD params from settings and always pass a VADParams object
-    vad_params_kwargs: dict = {}
-    if settings.vad_confidence is not None:
-        vad_params_kwargs["confidence"] = settings.vad_confidence
-    if settings.vad_start_secs is not None:
-        vad_params_kwargs["start_secs"] = settings.vad_start_secs
-    if settings.vad_stop_secs is not None:
-        vad_params_kwargs["stop_secs"] = settings.vad_stop_secs
-    if settings.vad_min_volume is not None:
-        vad_params_kwargs["min_volume"] = settings.vad_min_volume
-
-    vad_params = VADParams(**vad_params_kwargs)
-    vad_analyzer = SileroVADAnalyzer(params=vad_params)
-
-    logger.info(f"SileroVADAnalyzer configuration: params={vad_params_kwargs}")
+    logger.info(
+        "SileroVADAnalyzer configured with "
+        f"params={vad_analyzer.params.model_dump(exclude_none=True)}"
+    )
 
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
         params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=False,  # No audio output for dictation
-            vad_analyzer=vad_analyzer,
         ),
     )
+    vad_frame_forwarder = VADFrameForwardingProcessor(vad_analyzer=vad_analyzer)
 
     # Create service switchers for this connection
     from pipecat.pipeline.base_pipeline import FrameProcessor as PipecatFrameProcessor
@@ -240,6 +249,7 @@ async def run_pipeline(
     pipeline = Pipeline(
         [
             transport.input(),
+            vad_frame_forwarder,
             stt_switcher,
             turn_controller,  # Controls turn boundaries, passes transcriptions through
             llm_gate,  # Gates frames to aggregator based on LLM formatting setting
@@ -249,6 +259,19 @@ async def run_pipeline(
             transport.output(),
         ]
     )
+
+    user_bot_latency_observer = UserBotLatencyObserver()
+
+    @user_bot_latency_observer.event_handler("on_latency_measured")
+    async def on_latency_measured(
+        observer: UserBotLatencyObserver,
+        latency_seconds: float,
+    ) -> None:
+        """Log measured user-to-bot latency."""
+        _ = observer
+        logger.debug(
+            f"⏱️ LATENCY FROM USER STOPPED SPEAKING TO BOT STARTED SPEAKING: {latency_seconds:.3f}s"
+        )
 
     # Create pipeline task - RTVI is automatically enabled and accessible via task.rtvi
     # This avoids duplicate RTVIObservers that caused text duplication in 0.0.101
@@ -262,7 +285,7 @@ async def run_pipeline(
         ),
         idle_timeout_frames=(HeartbeatFrame,),
         observers=[
-            UserBotLatencyLogObserver(),
+            user_bot_latency_observer,
             PipelineLogObserver(),
         ],
     )
@@ -558,6 +581,13 @@ async def webrtc_offer(
         # connections to STT/LLM providers.
         # Uses pre-computed provider lists from AppServices to avoid redundant
         # iteration through all providers on every connection.
+        vad_params = create_silero_vad_params(services.settings)
+        vad_analyzer = SileroVADAnalyzer(params=vad_params)
+        context_manager = DictationContextManager()
+        logger.info(
+            "SileroVADAnalyzer configured with "
+            f"params={vad_analyzer.params.model_dump(exclude_none=True)}"
+        )
         stt_services = create_all_available_stt_services(
             services.settings,
             services.available_stt_providers,
@@ -568,8 +598,6 @@ async def webrtc_offer(
         )
 
         # Create pipeline processors
-        # DictationContextManager wraps LLMContextAggregatorPair with dictation-specific features
-        context_manager = DictationContextManager()
         turn_controller = TurnController()
         llm_gate = LLMGateFilter()
         # Wire up turn controller to context manager for context reset coordination
@@ -584,6 +612,7 @@ async def webrtc_offer(
                 context_manager=context_manager,
                 turn_controller=turn_controller,
                 llm_gate=llm_gate,
+                vad_analyzer=vad_analyzer,
             )
         )
         services.active_pipeline_tasks.add(task)
