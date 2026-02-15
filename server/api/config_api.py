@@ -190,7 +190,7 @@ def build_provider_list(
 
 @config_router.get("/prompt/sections/default", response_model=DefaultSectionsResponse)
 @limiter.limit(RATE_LIMIT_CONFIG, key_func=get_ip_only)
-async def get_default_sections(_request: Request) -> DefaultSectionsResponse:
+async def get_default_sections(request: Request) -> DefaultSectionsResponse:
     """Get default prompts for each section.
 
     Rate limited to prevent abuse, though this endpoint serves static data.
